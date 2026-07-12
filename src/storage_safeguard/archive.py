@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -234,7 +235,7 @@ def apply_archive_plan(paths: AppPaths, plan_path: Path) -> dict[str, Any]:
     raw_bytes = 0
     compressed_bytes = 0
 
-    for session in plan["sessions"]:
+    for session_number, session in enumerate(plan["sessions"], start=1):
         sources = [Path(member["path"]) for member in session["files"]]
         if any_open(sources, opened):
             raise RuntimeError(f"session became active: {session['session_id']}")
@@ -272,10 +273,10 @@ def apply_archive_plan(paths: AppPaths, plan_path: Path) -> dict[str, Any]:
             "archived_at": iso_utc(utc_now()),
             "files": archived_members,
         }
-        atomic_json(manifest_path, manifest)
-
         quarantine = quarantine_run / key
         restore_record = quarantine / "_restore.json"
+        staged_manifest = quarantine / "_manifest.json"
+        atomic_json(staged_manifest, manifest)
         atomic_json(
             restore_record,
             {
@@ -299,8 +300,15 @@ def apply_archive_plan(paths: AppPaths, plan_path: Path) -> dict[str, Any]:
                     member["raw_sha256"] for member in archived_members if member["relative"] == str(destination.relative_to(quarantine / "files"))
                 ):
                     raise RuntimeError("quarantined source hash mismatch")
+            atomic_json(manifest_path, manifest)
             shutil.rmtree(quarantine)
             manifests.append(str(manifest_path))
+            if session_number % 500 == 0:
+                print(
+                    f"archive progress: {session_number}/{len(plan['sessions'])} sessions committed",
+                    file=sys.stderr,
+                    flush=True,
+                )
         except Exception:
             for source, destination in reversed(moved):
                 if destination.exists() and not source.exists():
@@ -399,6 +407,7 @@ def recover_quarantine(paths: AppPaths) -> dict[str, int]:
         payload = load_json(record)
         source_root = Path(payload["source_root"])
         files_root = record.parent / "files"
+        record_conflicts = 0
         for relative in payload["files"]:
             source = source_root / relative
             quarantined = files_root / relative
@@ -406,8 +415,18 @@ def recover_quarantine(paths: AppPaths) -> dict[str, int]:
                 continue
             if source.exists() or source.is_symlink():
                 conflicts += 1
+                record_conflicts += 1
                 continue
             source.parent.mkdir(parents=True, exist_ok=True)
             os.replace(quarantined, source)
             restored += 1
+        remaining = [path for path in files_root.rglob("*") if path.is_file()] if files_root.exists() else []
+        if not remaining and record_conflicts == 0:
+            record.unlink(missing_ok=True)
+            (record.parent / "_manifest.json").unlink(missing_ok=True)
+            for directory in (files_root, record.parent, record.parent.parent):
+                try:
+                    directory.rmdir()
+                except OSError:
+                    pass
     return {"restored": restored, "conflicts": conflicts}
