@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import stat
+import sys
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Iterator
@@ -229,7 +230,7 @@ def apply_clean_plan(paths: AppPaths, plan_path: Path) -> dict[str, Any]:
     reclaimed = 0
     removed = []
     skipped = []
-    for item in plan["candidates"]:
+    for item_number, item in enumerate(plan["candidates"], start=1):
         path = Path(item["path"])
         if not _identity_matches(path, item):
             skipped.append({"path": str(path), "reason": "identity drift"})
@@ -240,12 +241,20 @@ def apply_clean_plan(paths: AppPaths, plan_path: Path) -> dict[str, Any]:
         if item["type"] == "directory" and item["action"] == "delete-tree" and _has_git(path):
             skipped.append({"path": str(path), "reason": "Git metadata"})
             continue
-        before = allocated_bytes(path)
-        if item["action"] == "prune-mixed-cache":
-            _prune_mixed(path)
-        else:
-            _delete_tree(path)
-        reclaimed += before
-        removed.append(str(path))
+        try:
+            before = allocated_bytes(path)
+            if item["action"] == "prune-mixed-cache":
+                _prune_mixed(path)
+            else:
+                _delete_tree(path)
+            reclaimed += before
+            removed.append(str(path))
+            if item_number % 25 == 0:
+                print(
+                    f"cleanup progress: {item_number}/{len(plan['candidates'])} candidates processed",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        except OSError as exc:
+            skipped.append({"path": str(path), "reason": f"{exc.__class__.__name__}: {exc}"})
     return {"reclaimed_bytes": reclaimed, "removed": removed, "skipped": skipped}
-

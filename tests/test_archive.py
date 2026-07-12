@@ -50,6 +50,7 @@ class ArchiveRoundTripTests(unittest.TestCase):
 
         result = apply_archive_plan(self.paths, plan_path)
         self.assertEqual(1, result["sessions"])
+        self.assertEqual(1, result["manifest_count"])
         self.assertFalse(source.exists())
         self.assertEqual({"manifests": 1, "files": 1}, verify_all(self.paths))
 

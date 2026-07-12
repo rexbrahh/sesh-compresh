@@ -323,7 +323,7 @@ def apply_archive_plan(paths: AppPaths, plan_path: Path) -> dict[str, Any]:
         "raw_bytes": raw_bytes,
         "compressed_bytes": compressed_bytes,
         "reclaimed_bytes": raw_bytes - compressed_bytes,
-        "manifests": manifests,
+        "manifest_count": len(manifests),
     }
 
 

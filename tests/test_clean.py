@@ -4,7 +4,9 @@ import tempfile
 import unittest
 from datetime import timedelta
 from pathlib import Path
+from unittest import mock
 
+import storage_safeguard.clean as clean_module
 from storage_safeguard.clean import apply_clean_plan
 from storage_safeguard.common import AppPaths, atomic_json, iso_utc, utc_now
 
@@ -94,7 +96,26 @@ class CleanupSafetyTests(unittest.TestCase):
         self.assertTrue((cache / "trim.txt").exists())
         self.assertFalse((cache / "bucket").exists())
 
+    def test_permission_failure_is_isolated(self) -> None:
+        denied = self.home / "denied"
+        allowed = self.home / "allowed"
+        denied.mkdir()
+        allowed.mkdir()
+        plan = self.write_plan([self.make_item(denied), self.make_item(allowed)])
+        original = clean_module._delete_tree
+
+        def selective(path: Path) -> None:
+            if path == denied:
+                raise PermissionError("fixture denial")
+            original(path)
+
+        with mock.patch.object(clean_module, "_delete_tree", side_effect=selective):
+            result = apply_clean_plan(self.paths, plan)
+        self.assertTrue(denied.exists())
+        self.assertFalse(allowed.exists())
+        self.assertEqual(1, len(result["skipped"]))
+        self.assertIn("PermissionError", result["skipped"][0]["reason"])
+
 
 if __name__ == "__main__":
     unittest.main()
-
