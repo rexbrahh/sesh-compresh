@@ -6,9 +6,9 @@ from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 
-import storage_safeguard.clean as clean_module
-from storage_safeguard.clean import apply_clean_plan
-from storage_safeguard.common import AppPaths, atomic_json, iso_utc, utc_now
+import sesh_compresh.clean as clean_module
+from sesh_compresh.clean import apply_clean_plan
+from sesh_compresh.common import AppPaths, atomic_json, iso_utc, utc_now
 
 
 class CleanupSafetyTests(unittest.TestCase):

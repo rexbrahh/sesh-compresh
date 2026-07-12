@@ -7,7 +7,7 @@ import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 
-from storage_safeguard.archive import (
+from sesh_compresh.archive import (
     apply_archive_plan,
     create_archive_plan,
     iter_manifests,
@@ -15,7 +15,7 @@ from storage_safeguard.archive import (
     restore_manifest,
     verify_all,
 )
-from storage_safeguard.common import AppPaths, atomic_json, sha256_file, utc_now
+from sesh_compresh.common import AppPaths, atomic_json, sha256_file, utc_now
 
 
 class ArchiveRoundTripTests(unittest.TestCase):

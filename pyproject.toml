@@ -3,14 +3,13 @@ requires = ["setuptools>=75"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "storage-safeguard"
+name = "sesh-compresh"
 version = "0.1.0"
 description = "Transactional local session archiving and allowlisted build-cache cleanup"
 requires-python = ">=3.13"
 
 [project.scripts]
-storage-safeguard = "storage_safeguard.cli:main"
+sesh-compresh = "sesh_compresh.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-

@@ -62,7 +62,7 @@ def _audit(paths: AppPaths) -> dict[str, Any]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="storage-safeguard")
+    parser = argparse.ArgumentParser(prog="sesh-compresh")
     parser.add_argument("--home", type=Path, help="override home directory (primarily for tests)")
     parser.add_argument("--json", action="store_true")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -137,7 +137,7 @@ def main(argv: list[str] | None = None) -> int:
                 _emit(apply_clean_plan(paths, args.plan), args.json)
         return 0
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
-        print(f"storage-safeguard: {exc}", file=sys.stderr)
+        print(f"sesh-compresh: {exc}", file=sys.stderr)
         return 1
 
 

@@ -1,8 +1,8 @@
-# Storage Safeguard Product Contract
+# Sesh Compresh Product Contract
 
 ## Problem
 
-Developer build outputs and AI session histories grow quickly on this Mac. Build products are disposable, while transcripts, agent ledgers, QA evidence, and temporary worktrees may be irreplaceable. Storage Safeguard must recover space without conflating those classes.
+Developer build outputs and AI session histories grow quickly on this Mac. Build products are disposable, while transcripts, agent ledgers, QA evidence, and temporary worktrees may be irreplaceable. Sesh Compresh must recover space without conflating those classes.
 
 ## Product principles
 
@@ -24,7 +24,7 @@ Developer build outputs and AI session histories grow quickly on this Mac. Build
 
 Raw files are stored as zstd frames in a content-addressed object store. A versioned JSON manifest records the provider, session identifier, source root, relative paths, raw SHA-256, compressed SHA-256, byte size, mode, nanosecond mtime, last activity, and zstd version. Objects are written to temporary files, fsynced, tested with `zstd -t`, decompressed through SHA-256, and atomically renamed.
 
-Manifests live under `~/.local/share/storage-safeguard/archives/manifests`; objects live under the adjacent `objects/sha256` tree. Runtime plans and quarantine journals live under `~/.local/state/storage-safeguard`.
+Manifests live under `~/.local/share/sesh-compresh/archives/manifests`; objects live under the adjacent `objects/sha256` tree. Runtime plans and quarantine journals live under `~/.local/state/sesh-compresh`.
 
 ## Restore contract
 
@@ -47,4 +47,3 @@ The implementation must fail closed for source mutation, insufficient space, zst
 - Cleanup fixtures prove that dirty Git trees, unknown artifact formats, and protected runtime paths survive.
 - The first live run performs an archive/restore canary before any source removal.
 - Final verification reports archive integrity, protected-path checks, reclaimed bytes, and physical free space.
-

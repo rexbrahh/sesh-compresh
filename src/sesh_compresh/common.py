@@ -31,8 +31,8 @@ class AppPaths:
             state = Path(os.environ.get("XDG_STATE_HOME", resolved / ".local/state"))
         return cls(
             home=resolved,
-            archive=data / "storage-safeguard/archives",
-            state=state / "storage-safeguard",
+            archive=data / "sesh-compresh/archives",
+            state=state / "sesh-compresh",
         )
 
     def ensure_private(self) -> None:
