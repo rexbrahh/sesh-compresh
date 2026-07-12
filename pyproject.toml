@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "storage-safeguard"
+version = "0.1.0"
+description = "Transactional local session archiving and allowlisted build-cache cleanup"
+requires-python = ">=3.13"
+
+[project.scripts]
+storage-safeguard = "storage_safeguard.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
