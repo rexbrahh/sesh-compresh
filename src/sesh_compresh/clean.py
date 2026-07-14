@@ -19,6 +19,7 @@ from .common import (
     load_json,
     open_file_paths,
     parse_timestamp,
+    prune_expired_plans,
     utc_now,
 )
 
@@ -172,6 +173,7 @@ def create_clean_plan(paths: AppPaths, profile: str = "practical") -> tuple[Path
     }
     plan_path = paths.state / "plans" / f"clean-{run_id}.json"
     atomic_json(plan_path, plan)
+    prune_expired_plans(paths)
     return plan_path, plan
 
 

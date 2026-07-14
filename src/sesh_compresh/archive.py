@@ -9,20 +9,24 @@ import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from .common import (
     SCHEMA_VERSION,
     AppPaths,
     any_open,
+    app_lock,
     atomic_json,
+    ensure_safe_cas_shard,
     fsync_dir,
     identity_matches,
     iso_utc,
     load_json,
     open_file_paths,
     parse_timestamp,
+    prune_expired_plans,
     regular_file_stat,
+    safe_cas_object_path,
     sha256_file,
     sha256_stream,
     utc_now,
@@ -36,6 +40,50 @@ class SessionUnit:
     source_root: Path
     files: tuple[Path, ...]
     retention_days: int
+
+
+class SourceChangedError(RuntimeError):
+    """An identity-pinned archive source changed before its commit."""
+
+
+def validate_planned_session(session: dict[str, Any]) -> None:
+    required_strings = ("provider", "session_id", "source_root", "last_activity")
+    if any(not isinstance(session.get(key), str) or not session[key] for key in required_strings):
+        raise ValueError("archive session has invalid required metadata")
+    parse_timestamp(session["last_activity"])
+    root = Path(session["source_root"])
+    if not root.is_absolute():
+        raise ValueError("archive session source root must be absolute")
+    files = session.get("files")
+    if not isinstance(files, list) or not files:
+        raise ValueError("archive session must contain files")
+    directories = session.get("directories", [])
+    if not isinstance(directories, list):
+        raise ValueError("archive session directories must be a list")
+    seen: set[Path] = set()
+    entries = [
+        (member, "file", ("device", "inode", "size", "mtime_ns", "mode"))
+        for member in files
+    ] + [
+        (member, "directory", ("device", "inode", "mtime_ns", "mode"))
+        for member in directories
+    ]
+    for member, kind, identity_keys in entries:
+        if not isinstance(member, dict):
+            raise ValueError(f"archive session {kind} member must be an object")
+        path_value = member.get("path")
+        relative_value = member.get("relative")
+        if not isinstance(path_value, str) or not isinstance(relative_value, str):
+            raise ValueError(f"archive session {kind} path metadata is invalid")
+        relative = Path(relative_value)
+        path = Path(path_value)
+        if relative.is_absolute() or ".." in relative.parts or path != root / relative:
+            raise ValueError(f"archive session {kind} escaped its source root")
+        if path in seen:
+            raise ValueError(f"archive session contains a duplicate path: {path}")
+        seen.add(path)
+        if any(not isinstance(member.get(key), int) for key in identity_keys):
+            raise ValueError(f"archive session {kind} identity is invalid")
 
 
 def _max_jsonl_timestamp(path: Path) -> datetime:
@@ -73,12 +121,11 @@ def _bundle_files(primary: Path) -> tuple[Path, ...]:
 
 
 def discover_sessions(paths: AppPaths) -> Iterator[SessionUnit]:
-    observer = paths.home / ".claude/projects/-Users-rexliu--claude-mem-observer-sessions"
-    if observer.is_dir():
-        for source in sorted(observer.glob("*.jsonl")):
-            if source.is_file() and not source.is_symlink():
-                yield SessionUnit("claude-observer", source.stem, observer, (source,), 7)
+    # Import lazily because observer maintenance reuses the archive
+    # transaction primitives from this module.
+    from .observer import ClaudeMemPaths
 
+    observer = ClaudeMemPaths.discover(paths).observer_project
     claude_projects = paths.home / ".claude/projects"
     if claude_projects.is_dir():
         for project in sorted(claude_projects.iterdir()):
@@ -159,6 +206,7 @@ def create_archive_plan(paths: AppPaths, now: datetime | None = None) -> tuple[P
     }
     plan_path = paths.state / "plans" / f"archive-{run_id}.json"
     atomic_json(plan_path, plan)
+    prune_expired_plans(paths)
     return plan_path, plan
 
 
@@ -186,9 +234,11 @@ def _verify_zstd(binary: str, object_path: Path, raw_hash: str) -> None:
 
 
 def _ensure_object(paths: AppPaths, source: Path, raw_hash: str, zstd: str) -> tuple[Path, str]:
-    target = paths.archive / "objects/sha256" / raw_hash[:2] / f"{raw_hash}.zst"
-    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if target.exists():
+    shard = ensure_safe_cas_shard(paths.archive, raw_hash[:2])
+    relative = f"objects/sha256/{raw_hash[:2]}/{raw_hash}.zst"
+    target = shard / f"{raw_hash}.zst"
+    if target.exists() or target.is_symlink():
+        target = safe_cas_object_path(paths.archive, relative)
         _verify_zstd(zstd, target, raw_hash)
         return target, sha256_file(target)
 
@@ -205,6 +255,7 @@ def _ensure_object(paths: AppPaths, source: Path, raw_hash: str, zstd: str) -> t
             os.fsync(handle.fileno())
         _verify_zstd(zstd, tmp, raw_hash)
         compressed_hash = sha256_file(tmp)
+        ensure_safe_cas_shard(paths.archive, raw_hash[:2])
         os.replace(tmp, target)
         target.chmod(0o600)
         fsync_dir(target.parent)
@@ -220,13 +271,141 @@ def _manifest_key(session: dict[str, Any]) -> str:
     return hashlib.sha256(seed).hexdigest()[:20]
 
 
-def apply_archive_plan(paths: AppPaths, plan_path: Path) -> dict[str, Any]:
+def archive_planned_session(
+    paths: AppPaths,
+    session: dict[str, Any],
+    *,
+    zstd: str,
+    quarantine_run: Path,
+    before_move: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    """Archive one identity-pinned session transactionally.
+
+    The caller owns policy checks such as age, references, and open files.
+    This function owns the byte-integrity and source-to-quarantine transaction
+    shared by ordinary archives and reference-aware observer maintenance.
+    """
+
+    validate_planned_session(session)
+    sources = [Path(member["path"]) for member in session["files"]]
+    for source, member in zip(sources, session["files"], strict=True):
+        if not identity_matches(source, member):
+            raise SourceChangedError(f"source changed since plan: {source}")
+
+    key = _manifest_key(session)
+    manifest_path = paths.archive / "manifests" / session["provider"] / f"{key}.json"
+    archived_members: list[dict[str, Any]] = []
+    raw_bytes = 0
+    compressed_bytes = 0
+    for source, member in zip(sources, session["files"], strict=True):
+        raw_hash = sha256_file(source)
+        if not identity_matches(source, member):
+            raise SourceChangedError(f"source changed while hashing: {source}")
+        object_path, compressed_hash = _ensure_object(paths, source, raw_hash, zstd)
+        archived_members.append(
+            {
+                **member,
+                "raw_sha256": raw_hash,
+                "compressed_sha256": compressed_hash,
+                "object": str(object_path.relative_to(paths.archive)),
+            }
+        )
+        raw_bytes += member["size"]
+        compressed_bytes += object_path.stat().st_size
+
+    manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "session-archive",
+        "archive_id": key,
+        "provider": session["provider"],
+        "session_id": session["session_id"],
+        "source_root": session["source_root"],
+        "last_activity": session["last_activity"],
+        "archived_at": iso_utc(utc_now()),
+        "files": archived_members,
+    }
+    quarantine = quarantine_run / key
+    restore_record = quarantine / "_restore.json"
+    staged_manifest = quarantine / "_manifest.json"
+    atomic_json(staged_manifest, manifest)
+    atomic_json(
+        restore_record,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "source_root": session["source_root"],
+            "manifest": str(manifest_path),
+            "files": [member["relative"] for member in archived_members],
+        },
+    )
+    moved: list[tuple[Path, Path]] = []
+    removed_directories: list[tuple[Path, dict[str, Any]]] = []
+    try:
+        for source, member in zip(sources, archived_members, strict=True):
+            if not identity_matches(source, member):
+                raise SourceChangedError(f"source changed before quarantine: {source}")
+        if before_move is not None:
+            before_move()
+        for source, member in zip(sources, archived_members, strict=True):
+            destination = quarantine / "files" / member["relative"]
+            destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.replace(source, destination)
+            moved.append((source, destination))
+        for _, destination in moved:
+            relative = str(destination.relative_to(quarantine / "files"))
+            expected_hash = next(
+                member["raw_sha256"] for member in archived_members if member["relative"] == relative
+            )
+            if sha256_file(destination) != expected_hash:
+                raise RuntimeError("quarantined source hash mismatch")
+        directory_items = sorted(
+            session.get("directories", []),
+            key=lambda item: len(Path(item["path"]).parts),
+            reverse=True,
+        )
+        for item in directory_items:
+            directory = Path(item["path"])
+            if directory.is_symlink() or not directory.is_dir():
+                raise SourceChangedError(f"bundle directory changed before removal: {directory}")
+            try:
+                directory.rmdir()
+            except OSError as exc:
+                raise SourceChangedError(f"bundle directory is no longer empty: {directory}") from exc
+            removed_directories.append((directory, item))
+        atomic_json(manifest_path, manifest)
+        shutil.rmtree(quarantine)
+    except Exception:
+        for directory, item in reversed(removed_directories):
+            directory.mkdir(parents=True, exist_ok=True, mode=item["mode"])
+            directory.chmod(item["mode"])
+        for source, destination in reversed(moved):
+            if destination.exists() and not source.exists():
+                source.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(destination, source)
+        if not moved:
+            shutil.rmtree(quarantine, ignore_errors=True)
+        raise
+
+    return {
+        "manifest": str(manifest_path),
+        "raw_bytes": raw_bytes,
+        "compressed_bytes": compressed_bytes,
+    }
+
+
+def _apply_archive_plan_locked(paths: AppPaths, plan_path: Path) -> dict[str, Any]:
     paths.ensure_private()
     plan = load_json(plan_path)
     if plan.get("schema_version") != SCHEMA_VERSION or plan.get("kind") != "archive-plan":
         raise ValueError("unsupported archive plan")
     if utc_now() > parse_timestamp(plan["expires_at"]):
         raise RuntimeError("archive plan expired")
+    sessions = plan.get("sessions")
+    if not isinstance(sessions, list):
+        raise ValueError("archive plan sessions must be a list")
+    for session in sessions:
+        if not isinstance(session, dict):
+            raise ValueError("archive plan session must be an object")
+        validate_planned_session(session)
 
     zstd = _zstd_binary()
     opened = open_file_paths()
@@ -235,86 +414,25 @@ def apply_archive_plan(paths: AppPaths, plan_path: Path) -> dict[str, Any]:
     raw_bytes = 0
     compressed_bytes = 0
 
-    for session_number, session in enumerate(plan["sessions"], start=1):
+    for session_number, session in enumerate(sessions, start=1):
         sources = [Path(member["path"]) for member in session["files"]]
         if any_open(sources, opened):
             raise RuntimeError(f"session became active: {session['session_id']}")
-        for source, member in zip(sources, session["files"], strict=True):
-            if not identity_matches(source, member):
-                raise RuntimeError(f"source changed since plan: {source}")
-
-        key = _manifest_key(session)
-        manifest_path = paths.archive / "manifests" / session["provider"] / f"{key}.json"
-        archived_members: list[dict[str, Any]] = []
-        for source, member in zip(sources, session["files"], strict=True):
-            raw_hash = sha256_file(source)
-            if not identity_matches(source, member):
-                raise RuntimeError(f"source changed while hashing: {source}")
-            object_path, compressed_hash = _ensure_object(paths, source, raw_hash, zstd)
-            archived_members.append(
-                {
-                    **member,
-                    "raw_sha256": raw_hash,
-                    "compressed_sha256": compressed_hash,
-                    "object": str(object_path.relative_to(paths.archive)),
-                }
-            )
-            raw_bytes += member["size"]
-            compressed_bytes += object_path.stat().st_size
-
-        manifest = {
-            "schema_version": SCHEMA_VERSION,
-            "kind": "session-archive",
-            "archive_id": key,
-            "provider": session["provider"],
-            "session_id": session["session_id"],
-            "source_root": session["source_root"],
-            "last_activity": session["last_activity"],
-            "archived_at": iso_utc(utc_now()),
-            "files": archived_members,
-        }
-        quarantine = quarantine_run / key
-        restore_record = quarantine / "_restore.json"
-        staged_manifest = quarantine / "_manifest.json"
-        atomic_json(staged_manifest, manifest)
-        atomic_json(
-            restore_record,
-            {
-                "schema_version": SCHEMA_VERSION,
-                "source_root": session["source_root"],
-                "manifest": str(manifest_path),
-                "files": [member["relative"] for member in archived_members],
-            },
+        result = archive_planned_session(
+            paths,
+            session,
+            zstd=zstd,
+            quarantine_run=quarantine_run,
         )
-        moved: list[tuple[Path, Path]] = []
-        try:
-            for source, member in zip(sources, archived_members, strict=True):
-                if not identity_matches(source, member):
-                    raise RuntimeError(f"source changed before quarantine: {source}")
-                destination = quarantine / "files" / member["relative"]
-                destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                os.replace(source, destination)
-                moved.append((source, destination))
-            for _, destination in moved:
-                if sha256_file(destination) != next(
-                    member["raw_sha256"] for member in archived_members if member["relative"] == str(destination.relative_to(quarantine / "files"))
-                ):
-                    raise RuntimeError("quarantined source hash mismatch")
-            atomic_json(manifest_path, manifest)
-            shutil.rmtree(quarantine)
-            manifests.append(str(manifest_path))
-            if session_number % 500 == 0:
-                print(
-                    f"archive progress: {session_number}/{len(plan['sessions'])} sessions committed",
-                    file=sys.stderr,
-                    flush=True,
-                )
-        except Exception:
-            for source, destination in reversed(moved):
-                if destination.exists() and not source.exists():
-                    source.parent.mkdir(parents=True, exist_ok=True)
-                    os.replace(destination, source)
-            raise
+        raw_bytes += result["raw_bytes"]
+        compressed_bytes += result["compressed_bytes"]
+        manifests.append(result["manifest"])
+        if session_number % 500 == 0:
+            print(
+                f"archive progress: {session_number}/{len(sessions)} sessions committed",
+                file=sys.stderr,
+                flush=True,
+            )
 
     if quarantine_run.exists() and not any(quarantine_run.iterdir()):
         quarantine_run.rmdir()
@@ -325,6 +443,11 @@ def apply_archive_plan(paths: AppPaths, plan_path: Path) -> dict[str, Any]:
         "reclaimed_bytes": raw_bytes - compressed_bytes,
         "manifest_count": len(manifests),
     }
+
+
+def apply_archive_plan(paths: AppPaths, plan_path: Path) -> dict[str, Any]:
+    with app_lock(paths):
+        return _apply_archive_plan_locked(paths, plan_path)
 
 
 def iter_manifests(paths: AppPaths) -> Iterator[Path]:
@@ -339,7 +462,7 @@ def verify_manifest(paths: AppPaths, manifest_path: Path) -> dict[str, Any]:
         raise ValueError(f"unsupported manifest: {manifest_path}")
     zstd = _zstd_binary()
     for member in manifest["files"]:
-        object_path = paths.archive / member["object"]
+        object_path = safe_cas_object_path(paths.archive, member["object"])
         if sha256_file(object_path) != member["compressed_sha256"]:
             raise RuntimeError(f"compressed SHA-256 mismatch: {object_path}")
         _verify_zstd(zstd, object_path, member["raw_sha256"])
@@ -382,7 +505,15 @@ def restore_manifest(paths: AppPaths, reference: str, destination: Path | None =
         tmp = Path(raw_tmp)
         try:
             subprocess.run(
-                [zstd, "-q", "-d", "-f", str(paths.archive / member["object"]), "-o", str(tmp)],
+                [
+                    zstd,
+                    "-q",
+                    "-d",
+                    "-f",
+                    str(safe_cas_object_path(paths.archive, member["object"])),
+                    "-o",
+                    str(tmp),
+                ],
                 check=True,
             )
             if sha256_file(tmp) != member["raw_sha256"]:

@@ -16,6 +16,7 @@ from sesh_compresh.archive import (
     verify_all,
 )
 from sesh_compresh.common import AppPaths, atomic_json, sha256_file, utc_now
+from sesh_compresh.observer import ClaudeMemPaths
 
 
 class ArchiveRoundTripTests(unittest.TestCase):
@@ -23,14 +24,14 @@ class ArchiveRoundTripTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.home = Path(self.temp.name)
         self.paths = AppPaths.discover(self.home)
-        self.observer = self.home / ".claude/projects/-Users-rexliu--claude-mem-observer-sessions"
-        self.observer.mkdir(parents=True)
+        self.project = self.home / ".claude/projects/-fixture-project"
+        self.project.mkdir(parents=True)
 
     def tearDown(self) -> None:
         self.temp.cleanup()
 
     def write_session(self, name: str, timestamp: str = "2020-01-01T00:00:00Z") -> Path:
-        path = self.observer / f"{name}.jsonl"
+        path = self.project / f"{name}.jsonl"
         records = [
             {"type": "user", "timestamp": timestamp, "content": "repeat " * 5000},
             {"type": "assistant", "timestamp": timestamp, "content": "answer " * 5000},
@@ -57,7 +58,7 @@ class ArchiveRoundTripTests(unittest.TestCase):
         manifest = next(iter_manifests(self.paths))
         destination = self.home / "restore-canary"
         restored = restore_manifest(self.paths, str(manifest), destination)
-        restored_path = destination / source.relative_to(self.observer)
+        restored_path = destination / source.relative_to(self.project)
         self.assertEqual(1, restored["files"])
         self.assertEqual(original_hash, sha256_file(restored_path))
         self.assertEqual(original_mode, restored_path.stat().st_mode & 0o777)
@@ -67,13 +68,38 @@ class ArchiveRoundTripTests(unittest.TestCase):
 
     def test_recent_and_malformed_sessions_are_preserved(self) -> None:
         recent = self.write_session("recent", "2026-07-11T00:00:00Z")
-        malformed = self.observer / "bad.jsonl"
+        malformed = self.project / "bad.jsonl"
         malformed.write_text('{"timestamp":"2020-01-01T00:00:00Z"}\nnot-json\n', encoding="utf-8")
         _, plan = create_archive_plan(self.paths, datetime(2026, 7, 12, tzinfo=UTC))
         self.assertEqual([], plan["sessions"])
         self.assertTrue(recent.exists())
         self.assertTrue(malformed.exists())
         self.assertGreaterEqual(plan["skipped"].get("recent", 0), 1)
+
+    def test_generic_archive_excludes_observer_sessions(self) -> None:
+        observer = ClaudeMemPaths.discover(self.paths, environ={}).observer_project
+        observer.mkdir(parents=True)
+        source = observer / "12345678-1234-1234-1234-123456789abc.jsonl"
+        source.write_text('{"timestamp":"2020-01-01T00:00:00Z"}\n', encoding="utf-8")
+
+        _, plan = create_archive_plan(self.paths, utc_now())
+
+        self.assertEqual([], plan["sessions"])
+        self.assertTrue(source.exists())
+
+    def test_malformed_later_plan_entry_causes_zero_mutation(self) -> None:
+        first = self.write_session("session-first")
+        second = self.write_session("session-second")
+        plan_path, plan = create_archive_plan(self.paths, utc_now())
+        plan["sessions"][1]["files"][0]["size"] = "invalid"
+        atomic_json(plan_path, plan)
+
+        with self.assertRaisesRegex(ValueError, "identity is invalid"):
+            apply_archive_plan(self.paths, plan_path)
+
+        self.assertTrue(first.exists())
+        self.assertTrue(second.exists())
+        self.assertEqual([], list((self.paths.archive / "manifests").rglob("*.json")))
 
     def test_recover_restores_quarantined_source(self) -> None:
         original_root = self.home / "source"
