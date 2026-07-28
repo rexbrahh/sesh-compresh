@@ -6,11 +6,13 @@
 - reference-aware containment of runaway claude-mem observer transcripts;
 - deletion of narrowly allowlisted build and test caches after an immutable plan is reviewed.
 
-It never uploads data. See [docs/product.md](docs/product.md) for the safety and data-format contract.
+It never uploads data. See [docs/product.md](docs/product.md) for the safety and data-format contract, and [docs/compression.md](docs/compression.md) for the lossless compression roadmap.
 
 ```sh
 PYTHONPATH=src python3 -m sesh_compresh audit
 PYTHONPATH=src python3 -m sesh_compresh archive plan
+PYTHONPATH=src python3 -m sesh_compresh archive stats
+PYTHONPATH=src python3 -m sesh_compresh archive train-dictionary --provider claude
 PYTHONPATH=src python3 -m sesh_compresh observer plan
 PYTHONPATH=src python3 -m sesh_compresh clean plan --profile practical
 ```

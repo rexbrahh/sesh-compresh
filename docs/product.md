@@ -35,7 +35,9 @@ Observer liveness enumeration requires `lsof`, which targets macOS and Linux by 
 
 ## Archive format
 
-Raw files are stored as zstd frames in a content-addressed object store. A versioned JSON manifest records the provider, session identifier, source root, relative paths, raw SHA-256, compressed SHA-256, byte size, mode, nanosecond mtime, last activity, and zstd version. Objects are written to temporary files, fsynced, tested with `zstd -t`, decompressed through SHA-256, and atomically renamed.
+Raw content is stored as zstd frames in a content-addressed object store. Each manifest member is compressed with exactly one recipe, chosen by role and size: bundle companions compress against the bundle's primary member (`--patch-from`); members above 1 MiB split into newline-aligned chunks of roughly 1 MiB, each stored as its own object (zstd level 12, or level 19 with a 128 MiB long-range window for chunks at or above 8 MiB); remaining whole-file members use level 6, optionally with a trained provider dictionary (`-D`). Chunks never split a record: an oversized single line becomes its own chunk. A versioned JSON manifest records the provider, session identifier, source root, relative paths, raw SHA-256, compressed SHA-256, byte size, mode, nanosecond mtime, last activity, zstd version, per-member recipe (reference relative, dictionary object, or an ordered chunk list), and bundle directory metadata (relative path, mode, nanosecond mtime). Manifests carrying recipes are schema version 2; plain manifests remain version 1, and both are accepted on read. Objects are written to temporary files, fsynced, tested with `zstd -t`, decompressed through SHA-256, and atomically renamed.
+
+An existing object is reused only after proving which recipe reproduces the raw bytes, and the manifest records the recipe that actually verified, so deduplication never invalidates another manifest's decode path. Provider dictionaries are trained from live session sources, stored as raw `.dict` objects in the CAS, and referenced from manifests; reachability keeps a dictionary alive while any manifest references it. A missing or unverifiable dictionary only falls back to plain compression and never blocks archiving.
 
 Manifests live under `~/.local/share/sesh-compresh/archives/manifests`; objects live under the adjacent `objects/sha256` tree. Runtime plans and quarantine journals live under `~/.local/state/sesh-compresh`.
 
@@ -47,7 +49,7 @@ Plan creation preserves every unexpired plan and retains the newest 32 expired p
 
 ## Restore contract
 
-Restore recreates every manifest member through a temporary file, verifies the raw digest, restores mode and mtime, and atomically renames it into place. Existing destinations cause a hard failure. A caller may restore to the original root or an isolated destination.
+Restore recreates every manifest member through a temporary file, verifies the raw digest (per chunk and whole-file for chunked members), restores mode and mtime, fsyncs, and atomically renames it into place. Recorded bundle directories are then recreated with their recorded mode and mtime. Existing destinations cause a hard failure. A caller may restore to the original root or an isolated destination.
 
 ## Cleanup contract
 
@@ -57,7 +59,7 @@ Standalone files, agent artifacts, session/runtime directories, dirty worktrees,
 
 ## Failure model
 
-The implementation must fail closed for source mutation, insufficient space, zstd failure, digest mismatch, open files, expired plans, identity drift, restore collisions, malformed JSONL or corpus state, incompatible liveness databases, failed open-file enumeration, and interrupted moves. Quarantine recovery restores any moved source whose destination remains absent.
+The implementation must fail closed for source mutation, insufficient space, zstd failure, digest mismatch, open files, expired plans, identity drift, restore collisions, malformed JSONL or corpus state, incompatible liveness databases, failed open-file enumeration, and interrupted moves. Quarantine recovery restores any moved source whose destination remains absent. A CAS object that fails verification on a deduplication hit is moved aside as a forensic `.corrupt-*` file and rebuilt from its verified source; crash-remnant compression temps in the CAS are collected by observer expiry.
 
 ## Acceptance criteria
 
