@@ -13,13 +13,16 @@ from typing import Any, Iterator, Mapping
 
 from .archive import (
     SourceChangedError,
+    _chunk_object_relative,
     _zstd_binary,
     archive_planned_session,
     iter_manifests,
+    load_provider_dictionary,
     validate_planned_session,
 )
 from .common import (
     SCHEMA_VERSION,
+    SUPPORTED_SCHEMA_VERSIONS,
     AppPaths,
     any_open,
     app_lock,
@@ -48,7 +51,8 @@ SESSION_ID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
-CAS_NAME_PATTERN = re.compile(r"^[0-9a-f]{64}\.zst$")
+CAS_NAME_PATTERN = re.compile(r"^[0-9a-f]{64}\.(zst|dict)$")
+CAS_TEMP_PATTERN = re.compile(r"^\.[0-9a-f]{64}\..+\.part$")
 
 
 def _setting_record(path: Path) -> dict[str, Any]:
@@ -276,9 +280,8 @@ def session_is_referenced(runtime: ClaudeMemPaths, session_id: str) -> bool:
                     "claude-mem database has no sdk_sessions.memory_session_id column"
                 )
             row = connection.execute(
-                "SELECT 1 FROM sdk_sessions "
-                "WHERE memory_session_id = ? OR memory_session_id = ? LIMIT 1",
-                (session_id, session_id.upper()),
+                "SELECT 1 FROM sdk_sessions WHERE LOWER(memory_session_id) = ? LIMIT 1",
+                (session_id,),
             ).fetchone()
             if row is not None:
                 return True
@@ -486,7 +489,7 @@ def create_observer_gc_plan(
 
 
 def _validate_observer_plan(plan: dict[str, Any], runtime: ClaudeMemPaths) -> None:
-    if plan.get("schema_version") != SCHEMA_VERSION or plan.get("kind") != "observer-gc-plan":
+    if plan.get("schema_version") not in SUPPORTED_SCHEMA_VERSIONS or plan.get("kind") != "observer-gc-plan":
         raise ValueError("unsupported observer GC plan")
     if not isinstance(plan.get("run_id"), str) or not isinstance(plan.get("expires_at"), str):
         raise ValueError("observer GC plan metadata is invalid")
@@ -508,10 +511,11 @@ def _validate_observer_plan(plan: dict[str, Any], runtime: ClaudeMemPaths) -> No
     if not isinstance(candidates, list):
         raise ValueError("observer GC plan candidates must be a list")
     identity = plan.get("observer_project_identity")
-    if candidates and not isinstance(identity, dict):
-        raise ValueError("observer GC plan has candidates without a directory identity")
-    if candidates and any(not isinstance(identity.get(key), int) for key in ("device", "inode")):
-        raise ValueError("observer GC plan directory identity is invalid")
+    if candidates:
+        if not isinstance(identity, dict):
+            raise ValueError("observer GC plan has candidates without a directory identity")
+        if any(not isinstance(identity.get(key), int) for key in ("device", "inode")):
+            raise ValueError("observer GC plan directory identity is invalid")
     seen: set[str] = set()
     for session in candidates:
         if not isinstance(session, dict):
@@ -659,6 +663,7 @@ def _apply_observer_gc_plan_locked(
 
     zstd = _zstd_binary()
     quarantine_run = paths.state / "quarantine" / plan["run_id"]
+    dictionary = load_provider_dictionary(paths, OBSERVER_PROVIDER)
     archived: list[str] = []
     skipped: list[dict[str, str]] = []
     raw_bytes = 0
@@ -682,6 +687,7 @@ def _apply_observer_gc_plan_locked(
                 zstd=zstd,
                 quarantine_run=quarantine_run,
                 before_move=before_move,
+                dictionary=dictionary,
             )
             raw_bytes += result["raw_bytes"]
             compressed_bytes += result["compressed_bytes"]
@@ -720,7 +726,7 @@ def _object_path(paths: AppPaths, value: Any) -> Path:
 def _manifest_record(paths: AppPaths, manifest_path: Path) -> dict[str, Any]:
     stat = regular_file_stat(manifest_path)
     manifest = load_json(manifest_path)
-    if manifest.get("schema_version") != SCHEMA_VERSION or manifest.get("kind") != "session-archive":
+    if manifest.get("schema_version") not in SUPPORTED_SCHEMA_VERSIONS or manifest.get("kind") != "session-archive":
         raise ValueError(f"unsupported archive manifest: {manifest_path}")
     provider = manifest.get("provider")
     if not isinstance(provider, str) or not provider:
@@ -743,10 +749,28 @@ def _manifest_record(paths: AppPaths, manifest_path: Path) -> dict[str, Any]:
     for member in files:
         if not isinstance(member, dict):
             raise ValueError(f"archive manifest has an invalid member: {manifest_path}")
-        object_path = _object_path(paths, member.get("object"))
-        if object_path.is_symlink() or not object_path.is_file():
-            raise ValueError(f"archive object is missing or unsafe: {object_path}")
-        objects.add(str(object_path.relative_to(paths.archive)))
+        chunks = member.get("chunks")
+        if chunks is not None:
+            if not isinstance(chunks, list) or not chunks:
+                raise ValueError(f"archive manifest has invalid chunks: {manifest_path}")
+            for chunk in chunks:
+                if not isinstance(chunk, dict):
+                    raise ValueError(f"archive manifest has invalid chunks: {manifest_path}")
+                chunk_path = _object_path(paths, _chunk_object_relative(chunk.get("sha256")))
+                if chunk_path.is_symlink() or not chunk_path.is_file():
+                    raise ValueError(f"archive chunk is missing or unsafe: {chunk_path}")
+                objects.add(str(chunk_path.relative_to(paths.archive)))
+        else:
+            object_path = _object_path(paths, member.get("object"))
+            if object_path.is_symlink() or not object_path.is_file():
+                raise ValueError(f"archive object is missing or unsafe: {object_path}")
+            objects.add(str(object_path.relative_to(paths.archive)))
+        dictionary = member.get("dictionary")
+        if dictionary is not None:
+            dictionary_path = _object_path(paths, dictionary)
+            if dictionary_path.is_symlink() or not dictionary_path.is_file():
+                raise ValueError(f"archive dictionary is missing or unsafe: {dictionary_path}")
+            objects.add(str(dictionary_path.relative_to(paths.archive)))
     return {
         "path": str(manifest_path),
         "provider": provider,
@@ -792,7 +816,13 @@ def _identity_pinned_orphan_objects(paths: AppPaths, reachable: set[str]) -> lis
             relative = str(path.relative_to(paths.archive))
             if relative in reachable:
                 continue
-            if not CAS_NAME_PATTERN.fullmatch(path.name) or path.parent.name != path.name[:2]:
+            # Writers and this sweep share the app lock, so a leftover
+            # compression temp is provably a crash remnant, never in flight.
+            if CAS_NAME_PATTERN.fullmatch(path.name) and path.parent.name == path.name[:2]:
+                pass
+            elif CAS_TEMP_PATTERN.fullmatch(path.name) and path.parent.name == path.name[1:3]:
+                pass
+            else:
                 continue
             try:
                 safe_cas_object_path(paths.archive, relative)
@@ -917,7 +947,7 @@ def create_observer_expiry_plan(
 
 
 def _validate_expiry_plan_structure(paths: AppPaths, plan: dict[str, Any]) -> None:
-    if plan.get("schema_version") != SCHEMA_VERSION or plan.get("kind") != "observer-expiry-plan":
+    if plan.get("schema_version") not in SUPPORTED_SCHEMA_VERSIONS or plan.get("kind") != "observer-expiry-plan":
         raise ValueError("unsupported observer archive expiry plan")
     if plan.get("provider") != OBSERVER_PROVIDER:
         raise ValueError("observer archive expiry plan has an unsupported provider")

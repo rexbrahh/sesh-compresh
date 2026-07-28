@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable, Protocol
+from typing import Any, Iterable, Iterator, Protocol
 
 if os.name == "nt":
     import msvcrt as _msvcrt
@@ -25,7 +25,8 @@ else:
     _msvcrt = None
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = (1, 2)
 
 
 @dataclass(frozen=True)
@@ -222,7 +223,7 @@ def _platform_lock_backend() -> LockBackend:
 
 
 @contextmanager
-def app_lock(paths: AppPaths, *, backend: LockBackend | None = None) -> Iterable[None]:
+def app_lock(paths: AppPaths, *, backend: LockBackend | None = None) -> Iterator[None]:
     """Serialize local archive publication, GC mutation, and CAS collection."""
 
     paths.ensure_private()

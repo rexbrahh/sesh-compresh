@@ -11,6 +11,7 @@ from typing import Any, Iterator
 
 from .common import (
     SCHEMA_VERSION,
+    SUPPORTED_SCHEMA_VERSIONS,
     AppPaths,
     allocated_bytes,
     any_open,
@@ -224,7 +225,7 @@ def _prune_mixed(path: Path) -> None:
 
 def apply_clean_plan(paths: AppPaths, plan_path: Path) -> dict[str, Any]:
     plan = load_json(plan_path)
-    if plan.get("schema_version") != SCHEMA_VERSION or plan.get("kind") != "clean-plan":
+    if plan.get("schema_version") not in SUPPORTED_SCHEMA_VERSIONS or plan.get("kind") != "clean-plan":
         raise ValueError("unsupported cleanup plan")
     if utc_now() > parse_timestamp(plan["expires_at"]):
         raise RuntimeError("cleanup plan expired")

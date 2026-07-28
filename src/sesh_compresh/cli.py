@@ -10,10 +10,12 @@ from typing import Any
 
 from .archive import (
     apply_archive_plan,
+    archive_stats,
     create_archive_plan,
     iter_manifests,
     recover_quarantine,
     restore_manifest,
+    train_dictionary,
     verify_all,
 )
 from .clean import apply_clean_plan, create_clean_plan
@@ -87,7 +89,14 @@ def build_parser() -> argparse.ArgumentParser:
     archive_apply.add_argument("plan", type=Path)
     archive_apply.add_argument("--yes", action="store_true", required=True)
     archive_sub.add_parser("list")
+    archive_sub.add_parser("stats")
     archive_sub.add_parser("verify")
+    archive_train = archive_sub.add_parser("train-dictionary")
+    archive_train.add_argument(
+        "--provider", required=True, choices=("claude", "codex", "codex-archived")
+    )
+    archive_train.add_argument("--samples", type=int, default=256)
+    archive_train.add_argument("--max-dict-kib", type=int, default=112)
     archive_restore = archive_sub.add_parser("restore")
     archive_restore.add_argument("manifest")
     archive_restore.add_argument("--destination", type=Path)
@@ -177,6 +186,18 @@ def main(argv: list[str] | None = None) -> int:
             elif args.archive_command == "list":
                 manifests = [str(path) for path in iter_manifests(paths)]
                 _emit({"count": len(manifests), "manifests": manifests}, args.json)
+            elif args.archive_command == "stats":
+                _emit(archive_stats(paths), args.json)
+            elif args.archive_command == "train-dictionary":
+                _emit(
+                    train_dictionary(
+                        paths,
+                        args.provider,
+                        sample_limit=args.samples,
+                        max_dict_bytes=args.max_dict_kib * 1024,
+                    ),
+                    args.json,
+                )
             elif args.archive_command == "verify":
                 _emit(verify_all(paths), args.json)
             elif args.archive_command == "restore":

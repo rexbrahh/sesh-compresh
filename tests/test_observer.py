@@ -408,6 +408,23 @@ class ObserverGcTests(ObserverFixture):
         self.assertEqual("newly referenced", result["skipped"][0]["reason"])
         self.assertTrue(source.exists())
 
+    def test_mixed_case_reference_protects_at_final_check(self) -> None:
+        mixed_id = "abcdef01-2345-6789-abcd-ef0123456789"
+        source = self.write_session(mixed_id)
+        plan_path, _ = self.plan()
+        mixed_case = "".join(
+            character.upper() if index % 2 else character
+            for index, character in enumerate(mixed_id)
+        )
+        self.add_database_reference(mixed_case)
+
+        with mock.patch.object(observer_module, "open_file_paths_for", return_value=set()):
+            result = apply_observer_gc_plan(self.paths, self.runtime, plan_path)
+
+        self.assertEqual(0, result["archived"])
+        self.assertEqual("newly referenced", result["skipped"][0]["reason"])
+        self.assertTrue(source.exists())
+
     def test_pre_move_liveness_failure_aborts_without_mutation(self) -> None:
         source = self.write_session(ORPHAN_ID)
         plan_path, _ = self.plan()
@@ -531,6 +548,7 @@ class ObserverExpiryTests(unittest.TestCase):
         name: str,
         archived_at: datetime,
         objects: list[str],
+        dictionary: str | None = None,
     ) -> Path:
         path = self.paths.archive / "manifests" / provider / f"{name}.json"
         atomic_json(
@@ -544,7 +562,54 @@ class ObserverExpiryTests(unittest.TestCase):
                 "source_root": "/fixture",
                 "last_activity": archived_at.isoformat(),
                 "archived_at": archived_at.isoformat(),
-                "files": [{"object": value} for value in objects],
+                "files": [
+                    {
+                        "object": value,
+                        **({"dictionary": dictionary} if dictionary is not None else {}),
+                    }
+                    for value in objects
+                ],
+            },
+        )
+        return path
+
+    def make_dictionary(self, digest: str) -> str:
+        relative = f"objects/sha256/{digest[:2]}/{digest}.dict"
+        path = self.paths.archive / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"dictionary-bytes")
+        return relative
+
+    def make_chunk_manifest(
+        self,
+        provider: str,
+        name: str,
+        archived_at: datetime,
+        digests: list[str],
+    ) -> Path:
+        for digest in digests:
+            chunk = self.paths.archive / f"objects/sha256/{digest[:2]}/{digest}.zst"
+            chunk.parent.mkdir(parents=True, exist_ok=True)
+            chunk.write_bytes(b"chunk")
+        path = self.paths.archive / "manifests" / provider / f"{name}.json"
+        atomic_json(
+            path,
+            {
+                "schema_version": 2,
+                "kind": "session-archive",
+                "archive_id": name,
+                "provider": provider,
+                "session_id": name,
+                "source_root": "/fixture",
+                "last_activity": archived_at.isoformat(),
+                "archived_at": archived_at.isoformat(),
+                "files": [
+                    {
+                        "chunks": [{"sha256": digest, "size": 5} for digest in digests],
+                        "raw_sha256": "0" * 64,
+                        "size": 5 * len(digests),
+                    }
+                ],
             },
         )
         return path
@@ -651,6 +716,24 @@ class ObserverExpiryTests(unittest.TestCase):
         self.assertEqual(1, result["objects_removed"])
         self.assertFalse(orphan.exists())
 
+    def test_orphan_sweep_collects_crash_remnant_temps(self) -> None:
+        digest = "d" * 64
+        relative = f"objects/sha256/{digest[:2]}/.{digest}.abc123.part"
+        remnant = self.paths.archive / relative
+        remnant.parent.mkdir(parents=True)
+        remnant.write_bytes(b"partial")
+
+        plan_path, plan = create_observer_expiry_plan(
+            self.paths,
+            ttl_days=7,
+            cap_bytes=1024,
+        )
+        self.assertEqual([str(remnant)], [item["path"] for item in plan["cas_candidates"]])
+
+        result = apply_observer_expiry_plan(self.paths, plan_path)
+        self.assertEqual(1, result["objects_removed"])
+        self.assertFalse(remnant.exists())
+
     def test_symlink_shard_escape_fails_closed(self) -> None:
         now = datetime.now(UTC)
         root = self.paths.archive / "objects" / "sha256"
@@ -702,6 +785,87 @@ class ObserverExpiryTests(unittest.TestCase):
             )
 
         self.assertEqual(b"outside", object_path.read_bytes())
+
+    def test_expiry_preserves_dictionary_referenced_elsewhere(self) -> None:
+        now = datetime.now(UTC)
+        dictionary = self.make_dictionary("e" * 64)
+        observer_object = self.make_object("ff-expired")
+        observer = self.make_manifest(
+            OBSERVER_PROVIDER,
+            "observer-dict",
+            now - timedelta(days=10),
+            [observer_object],
+            dictionary=dictionary,
+        )
+        ordinary_object = self.make_object("a0-ordinary")
+        ordinary = self.make_manifest(
+            "claude",
+            "ordinary-dict",
+            now - timedelta(days=20),
+            [ordinary_object],
+            dictionary=dictionary,
+        )
+
+        plan_path, _ = create_observer_expiry_plan(
+            self.paths, ttl_days=7, cap_bytes=1024**4, now=now
+        )
+        result = apply_observer_expiry_plan(self.paths, plan_path)
+
+        self.assertEqual(1, result["manifests_removed"])
+        self.assertFalse(observer.exists())
+        self.assertTrue(ordinary.exists())
+        self.assertTrue((self.paths.archive / dictionary).exists())
+        self.assertFalse((self.paths.archive / observer_object).exists())
+
+    def test_expiry_collects_unreferenced_dictionary(self) -> None:
+        now = datetime.now(UTC)
+        dictionary = self.make_dictionary("e" * 64)
+        observer_object = self.make_object("f1-only")
+        self.make_manifest(
+            OBSERVER_PROVIDER,
+            "observer-dict-only",
+            now - timedelta(days=10),
+            [observer_object],
+            dictionary=dictionary,
+        )
+
+        plan_path, _ = create_observer_expiry_plan(
+            self.paths, ttl_days=7, cap_bytes=1024**4, now=now
+        )
+        result = apply_observer_expiry_plan(self.paths, plan_path)
+
+        self.assertEqual(1, result["manifests_removed"])
+        self.assertEqual(2, result["objects_removed"])
+        self.assertFalse((self.paths.archive / dictionary).exists())
+
+    def test_expiry_chunk_reachability(self) -> None:
+        now = datetime.now(UTC)
+        digest_one = "01" + "0" * 62
+        digest_two = "02" + "0" * 62
+        observer = self.make_chunk_manifest(
+            OBSERVER_PROVIDER,
+            "observer-chunked",
+            now - timedelta(days=10),
+            [digest_one, digest_two],
+        )
+        ordinary = self.make_chunk_manifest(
+            "claude",
+            "ordinary-chunked",
+            now - timedelta(days=20),
+            [digest_two],
+        )
+
+        plan_path, _ = create_observer_expiry_plan(
+            self.paths, ttl_days=7, cap_bytes=1024**4, now=now
+        )
+        result = apply_observer_expiry_plan(self.paths, plan_path)
+
+        self.assertEqual(1, result["manifests_removed"])
+        self.assertEqual(1, result["objects_removed"])
+        self.assertFalse(observer.exists())
+        self.assertTrue(ordinary.exists())
+        self.assertFalse((self.paths.archive / f"objects/sha256/01/{digest_one}.zst").exists())
+        self.assertTrue((self.paths.archive / f"objects/sha256/02/{digest_two}.zst").exists())
 
     def test_malformed_later_expiry_entry_causes_zero_mutation(self) -> None:
         now = datetime.now(UTC)
