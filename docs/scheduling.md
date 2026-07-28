@@ -2,10 +2,10 @@
 
 Run `sesh-compresh maintain` manually first. It creates immutable plans and reports candidates without mutation. Once the paths and policy look correct, schedule `sesh-compresh --json maintain --yes`; any failed liveness input or integrity check produces a non-zero exit.
 
-Use an absolute executable path in schedulers. A pipx installation is convenient:
+Use an absolute executable path in schedulers. Homebrew keeps a stable link at `/opt/homebrew/bin/sesh-compresh` across upgrades; a pipx installation from source works too:
 
 ```sh
-pipx install /path/to/sesh-compresh
+brew install rexbrahh/tap/sesh-compresh
 command -v sesh-compresh
 ```
 
