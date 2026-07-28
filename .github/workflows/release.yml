@@ -1,0 +1,64 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  dist:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: build distributions
+        run: pipx run build
+
+      - name: check distributions
+        run: pipx run twine check dist/*
+
+      - name: create github release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+  # Bumps the formula in rexbrahh/homebrew-tap. Requires a HOMEBREW_TAP_TOKEN
+  # secret with push access to the tap repository. Skips cleanly when the
+  # secret or the formula is absent.
+  tap:
+    needs: dist
+    runs-on: ubuntu-24.04
+    steps:
+      - name: bump homebrew formula
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "HOMEBREW_TAP_TOKEN is not set; skipping tap bump"
+            exit 0
+          fi
+          gh repo clone rexbrahh/homebrew-tap tap -- --depth 1
+          cd tap
+          formula=Formula/sesh-compresh.rb
+          if [ ! -f "$formula" ]; then
+            echo "formula not present in tap; skipping bump"
+            exit 0
+          fi
+          url="https://github.com/rexbrahh/sesh-compresh/archive/refs/tags/${TAG}.tar.gz"
+          sha="$(curl -fsSL "$url" | shasum -a 256 | cut -d' ' -f1)"
+          sed -i -E "s|url \"https://github.com/rexbrahh/sesh-compresh/archive/refs/tags/v[^\"]+\"|url \"${url}\"|" "$formula"
+          sed -i -E "s|sha256 \"[0-9a-f]{64}\"|sha256 \"${sha}\"|" "$formula"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || git commit -m "sesh-compresh ${TAG#v}"
+          git push

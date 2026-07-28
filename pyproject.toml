@@ -1,12 +1,29 @@
 [build-system]
-requires = ["setuptools>=75"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "sesh-compresh"
 version = "0.1.0"
 description = "Transactional local session archiving and allowlisted build-cache cleanup"
+readme = "README.md"
 requires-python = ">=3.13"
+license = "MIT"
+authors = [{ name = "rexbrahh" }]
+keywords = ["archiving", "compression", "zstd", "session", "cleanup"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Archiving :: Compression",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/rexbrahh/sesh-compresh"
+Repository = "https://github.com/rexbrahh/sesh-compresh.git"
 
 [project.scripts]
 sesh-compresh = "sesh_compresh.cli:main"

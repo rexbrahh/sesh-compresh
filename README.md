@@ -8,6 +8,16 @@
 
 It never uploads data. See [docs/product.md](docs/product.md) for the safety and data-format contract, and [docs/compression.md](docs/compression.md) for the lossless compression roadmap.
 
+## Install
+
+```sh
+brew install rexbrahh/tap/sesh-compresh
+```
+
+From source (Python 3.13+, stdlib only): `pipx install .`
+
+## Develop
+
 ```sh
 PYTHONPATH=src python3 -m sesh_compresh audit
 PYTHONPATH=src python3 -m sesh_compresh archive plan
