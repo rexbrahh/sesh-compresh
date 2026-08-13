@@ -1012,6 +1012,95 @@ def _clean_tombstone(quarantine: Path) -> Path:
     return quarantine.with_name(f".{quarantine.name}.deleting")
 
 
+def _clean_tombstone_state(tombstone: Path) -> Path:
+    return tombstone.with_name(f"{tombstone.name}.json")
+
+
+def _tombstone_identity(path: Path) -> dict[str, Any]:
+    info = path.stat(follow_symlinks=False)
+    return {
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "ctime_ns": info.st_ctime_ns,
+        "type": _fingerprint(path)["type"],
+    }
+
+
+def _tombstone_state_payload(
+    tombstone: Path, move: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "clean-deletion-staging",
+        "tombstone": str(tombstone),
+        "move_sha256": _canonical_json_digest(move),
+        **_tombstone_identity(tombstone),
+    }
+
+
+def _load_tombstone_state(
+    tombstone: Path, move: dict[str, Any], *, require_current: bool
+) -> dict[str, Any]:
+    state_path = _clean_tombstone_state(tombstone)
+    info = state_path.lstat()
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or (os.name != "nt" and stat.S_IMODE(info.st_mode) != 0o600)
+        or (
+            os.name != "nt"
+            and hasattr(os, "getuid")
+            and info.st_uid != os.getuid()
+        )
+    ):
+        raise RuntimeError(f"cleanup deletion staging state is unsafe: {state_path}")
+    payload = load_json(state_path)
+    if (
+        set(payload)
+        != {
+            "schema_version",
+            "kind",
+            "tombstone",
+            "move_sha256",
+            "device",
+            "inode",
+            "ctime_ns",
+            "type",
+        }
+        or payload.get("schema_version") != SCHEMA_VERSION
+        or payload.get("kind") != "clean-deletion-staging"
+        or payload.get("tombstone") != str(tombstone)
+        or payload.get("move_sha256") != _canonical_json_digest(move)
+        or any(
+            type(payload.get(key)) is not int
+            for key in ("device", "inode", "ctime_ns")
+        )
+        or payload.get("type") not in {"file", "directory", "symlink"}
+    ):
+        raise RuntimeError(f"cleanup deletion staging state changed: {state_path}")
+    if require_current:
+        current = _tombstone_identity(tombstone)
+        if any(
+            payload[key] != current[key]
+            for key in ("device", "inode", "ctime_ns", "type")
+        ):
+            raise RuntimeError(
+                f"cleanup deletion staging identity changed: {tombstone}"
+            )
+    return payload
+
+
+def _write_tombstone_state(tombstone: Path, move: dict[str, Any]) -> None:
+    state_path = _clean_tombstone_state(tombstone)
+    if _path_exists(state_path):
+        _load_tombstone_state(tombstone, move, require_current=False)
+    atomic_json(
+        state_path,
+        _tombstone_state_payload(tombstone, move),
+        replace=_path_exists(state_path),
+    )
+
+
 def _path_exists(path: Path) -> bool:
     return path.exists() or path.is_symlink()
 
@@ -1433,38 +1522,42 @@ def apply_clean_expiry_plan(paths: AppPaths, plan_path: Path) -> dict[str, Any]:
                 source = Path(move["source"])
                 quarantine = Path(move["quarantine"])
                 tombstone = _clean_tombstone(quarantine)
+                tombstone_state = _clean_tombstone_state(tombstone)
                 if (
                     _clean_move_matches(quarantine, move)
                     and not _path_exists(source)
                     and not _path_exists(tombstone)
+                    and not _path_exists(tombstone_state)
                 ):
                     state = "quarantined"
                 elif (
                     not _path_exists(source)
                     and not _path_exists(quarantine)
                     and _path_exists(tombstone)
+                    and _path_exists(tombstone_state)
                 ):
-                    identity = _fingerprint(tombstone)
-                    if any(
-                        identity[key] != move[key]
-                        for key in ("device", "inode", "type")
-                    ):
-                        raise RuntimeError(
-                            f"cleanup deletion staging identity changed: {tombstone}"
-                        )
+                    _load_tombstone_state(tombstone, move, require_current=True)
                     state = "deleting"
                 elif (
                     _clean_move_matches(source, move)
                     and not _path_exists(quarantine)
                     and not _path_exists(tombstone)
+                    and not _path_exists(tombstone_state)
                 ):
                     state = "not-moved"
                 elif _path_exists(source) and not any(
-                    _path_exists(path) for path in (quarantine, tombstone)
+                    _path_exists(path)
+                    for path in (quarantine, tombstone, tombstone_state)
                 ):
                     state = "skipped"
                 elif not any(
                     _path_exists(path) for path in (source, quarantine, tombstone)
+                ) and _path_exists(tombstone_state):
+                    _load_tombstone_state(tombstone, move, require_current=False)
+                    state = "removed-staged"
+                elif not any(
+                    _path_exists(path)
+                    for path in (source, quarantine, tombstone, tombstone_state)
                 ):
                     state = "removed"
                 else:
@@ -1483,10 +1576,15 @@ def apply_clean_expiry_plan(paths: AppPaths, plan_path: Path) -> dict[str, Any]:
             for move, state in states[item["path"]]:
                 quarantine = Path(move["quarantine"])
                 tombstone = _clean_tombstone(quarantine)
+                tombstone_state = _clean_tombstone_state(tombstone)
                 if state in {"not-moved", "skipped"}:
                     fsync_dir(Path(move["source"]).parent)
                     if quarantine.parent.exists():
                         fsync_dir(quarantine.parent)
+                    continue
+                if state == "removed-staged":
+                    tombstone_state.unlink()
+                    fsync_dir(quarantine.parent)
                     continue
                 if state == "removed":
                     if quarantine.parent.exists():
@@ -1498,11 +1596,20 @@ def apply_clean_expiry_plan(paths: AppPaths, plan_path: Path) -> dict[str, Any]:
                             f"cleanup deletion staging already exists: {tombstone}"
                         )
                     os.rename(quarantine, tombstone)
-                    fsync_dir(quarantine.parent)
-                if tombstone.is_symlink():
-                    tombstone.unlink()
-                else:
-                    _delete_tree(tombstone)
+                    _write_tombstone_state(tombstone, move)
+                _load_tombstone_state(tombstone, move, require_current=True)
+                try:
+                    if tombstone.is_symlink():
+                        tombstone.unlink()
+                    else:
+                        _delete_tree(tombstone)
+                except BaseException:
+                    if _path_exists(tombstone):
+                        _write_tombstone_state(tombstone, move)
+                    raise
+                fsync_dir(quarantine.parent)
+                _load_tombstone_state(tombstone, move, require_current=False)
+                tombstone_state.unlink()
                 fsync_dir(quarantine.parent)
                 removed_bytes += move["allocated_bytes"]
                 _remove_empty_clean_quarantine_parents(move)
