@@ -23,9 +23,31 @@ PYTHONPATH=src python3 -m sesh_compresh audit
 PYTHONPATH=src python3 -m sesh_compresh archive plan
 PYTHONPATH=src python3 -m sesh_compresh archive stats
 PYTHONPATH=src python3 -m sesh_compresh archive train-dictionary --provider claude
+PYTHONPATH=src python3 -m sesh_compresh archive encryption status
 PYTHONPATH=src python3 -m sesh_compresh observer plan
 PYTHONPATH=src python3 -m sesh_compresh clean plan --profile practical
 ```
+
+## Portable archives
+
+```sh
+# Export the exact reachable graph for selected manifests. The output must not exist.
+PYTHONPATH=src python3 -m sesh_compresh portable export sessions.zip MANIFEST [MANIFEST ...]
+
+# Validate an artifact and create a two-hour import plan.
+PYTHONPATH=src python3 -m sesh_compresh portable import plan sessions.zip
+
+# Review the plan, then publish its objects and manifests without replacement.
+PYTHONPATH=src python3 -m sesh_compresh portable import apply /path/to/portable-import-PLAN.json --yes
+
+# Finish an interrupted import.
+PYTHONPATH=src python3 -m sesh_compresh portable import recover --yes
+```
+
+Portable artifacts contain selected manifests and their exact whole-file,
+chunk, and dictionary object graph. Import validates the complete artifact in
+private staging before it publishes an object. It publishes objects before
+manifests and exposes all selected manifests together.
 
 ## Claude-mem observer containment
 
