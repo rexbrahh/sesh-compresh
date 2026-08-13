@@ -35,3 +35,14 @@ jobs:
 
       - name: test
         run: PYTHONPATH=src python -m unittest discover -s tests
+
+      - name: installed wheel smoke test
+        shell: bash
+        run: |
+          pipx run build --wheel
+          python -m venv "${RUNNER_TEMP}/sesh-compresh-wheel"
+          "${RUNNER_TEMP}/sesh-compresh-wheel/bin/pip" install --no-deps dist/*.whl
+          cd "${RUNNER_TEMP}"
+          "${RUNNER_TEMP}/sesh-compresh-wheel/bin/sesh-compresh" --help
+          "${RUNNER_TEMP}/sesh-compresh-wheel/bin/python" -c \
+            'import importlib.metadata, sesh_compresh; assert importlib.metadata.version("sesh-compresh") == sesh_compresh.__version__'
