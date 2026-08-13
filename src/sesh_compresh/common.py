@@ -4,16 +4,19 @@ import errno
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
 import tempfile
 import time
+import unicodedata
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Protocol
+from typing import Any, Iterable, Iterator, Literal, Protocol
 
 if os.name == "nt":
     import msvcrt as _msvcrt
@@ -28,6 +31,48 @@ else:
 SCHEMA_VERSION = 2
 SUPPORTED_SCHEMA_VERSIONS = (1, 2)
 
+_CAS_ZSTD_NAME = re.compile(
+    r"^(?P<raw>[0-9a-f]{64})(?:\.(?P<compressed>[0-9a-f]{64}))?\.zst$"
+)
+_CAS_DICTIONARY_NAME = re.compile(r"^(?P<raw>[0-9a-f]{64})\.dict$")
+_CAS_TEMP_NAME = re.compile(r"^\.(?P<raw>[0-9a-f]{64})\.[a-z0-9_]{8}\.part$")
+_RUN_ID = re.compile(r"^\d{8}T\d{6}\.\d{6}Z-[0-9a-f]{32}$")
+
+CasObjectKind = Literal["zstd", "dictionary", "temporary"]
+
+_UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = frozenset(
+    value
+    for value in (
+        errno.EINVAL,
+        getattr(errno, "ENOTSUP", None),
+        getattr(errno, "EOPNOTSUPP", None),
+    )
+    if value is not None
+)
+
+_ARCHIVE_PRIVATE_LAYOUT = (
+    ("manifests",),
+    ("dictionaries",),
+    ("objects",),
+    ("objects", "sha256"),
+)
+_STATE_PRIVATE_LAYOUT = (
+    ("clean-quarantine",),
+    ("latest",),
+    ("plans",),
+    ("quarantine",),
+)
+
+
+def _configured_root(value: str | Path, *, label: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise ValueError(f"{label} must be absolute: {path}")
+    try:
+        return path.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"{label} cannot be canonicalized: {path}: {exc}") from exc
+
 
 @dataclass(frozen=True)
 class AppPaths:
@@ -37,13 +82,19 @@ class AppPaths:
 
     @classmethod
     def discover(cls, home: Path | None = None) -> "AppPaths":
-        resolved = (home or Path.home()).expanduser().resolve()
+        resolved = _configured_root(home or Path.home(), label="home directory")
         if home is not None:
             data = resolved / ".local/share"
             state = resolved / ".local/state"
         else:
-            data = Path(os.environ.get("XDG_DATA_HOME", resolved / ".local/share"))
-            state = Path(os.environ.get("XDG_STATE_HOME", resolved / ".local/state"))
+            data = _configured_root(
+                os.environ.get("XDG_DATA_HOME", resolved / ".local/share"),
+                label="XDG data directory",
+            )
+            state = _configured_root(
+                os.environ.get("XDG_STATE_HOME", resolved / ".local/state"),
+                label="XDG state directory",
+            )
         return cls(
             home=resolved,
             archive=data / "sesh-compresh/archives",
@@ -51,13 +102,62 @@ class AppPaths:
         )
 
     def ensure_private(self) -> None:
-        for path in (self.archive, self.state):
-            path.mkdir(parents=True, exist_ok=True, mode=0o700)
-            path.chmod(0o700)
+        anchors = [
+            (self.archive, "archive root"),
+            (self.state, "state root"),
+            *(
+                (self.archive.joinpath(*parts), "archive private directory")
+                for parts in _ARCHIVE_PRIVATE_LAYOUT
+            ),
+            *(
+                (self.state.joinpath(*parts), "state private directory")
+                for parts in _STATE_PRIVATE_LAYOUT
+            ),
+        ]
+        for path, label in anchors:
+            _inspect_directory_anchor(path, label=label, allow_missing=True)
+        dynamic = [
+            *(
+                (path, "archive provider anchor")
+                for path in _directory_anchor_children(
+                    self.archive / "manifests", label="archive manifests root"
+                )
+            ),
+            *(
+                (path, "archive CAS shard")
+                for path in _directory_anchor_children(
+                    self.archive / "objects/sha256", label="archive CAS root"
+                )
+            ),
+            *(
+                (path, "quarantine run anchor")
+                for path in _directory_anchor_children(
+                    self.state / "quarantine", label="quarantine root"
+                )
+            ),
+        ]
+        _secure_directory_anchor(self.archive, label="archive root", parents=True)
+        _secure_directory_anchor(self.state, label="state root", parents=True)
+        for parts in _ARCHIVE_PRIVATE_LAYOUT:
+            ensure_private_subdirectory(self.archive, *parts)
+        for parts in _STATE_PRIVATE_LAYOUT:
+            ensure_private_subdirectory(self.state, *parts)
+        for path, label in dynamic:
+            _secure_directory_anchor(path, label=label, parents=False)
 
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def new_run_id(current: datetime) -> str:
+    return f"{current.astimezone(UTC):%Y%m%dT%H%M%S.%fZ}-{uuid.uuid4().hex}"
+
+
+def validate_run_id(value: Any) -> str:
+    if type(value) is not str or _RUN_ID.fullmatch(value) is None:
+        raise ValueError("plan run identifier is invalid")
+    return value
 
 
 def iso_utc(value: datetime) -> str:
@@ -87,7 +187,9 @@ def sha256_stream(stream: Any, chunk_size: int = 4 * 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
-def atomic_json(path: Path, payload: dict[str, Any]) -> None:
+def atomic_json(
+    path: Path, payload: dict[str, Any], *, replace: bool = True
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, raw = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     tmp = Path(raw)
@@ -98,7 +200,10 @@ def atomic_json(path: Path, payload: dict[str, Any]) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp, path)
+        if replace:
+            os.replace(tmp, path)
+        else:
+            os.link(tmp, path)
         fsync_dir(path.parent)
     finally:
         tmp.unlink(missing_ok=True)
@@ -113,14 +218,12 @@ def load_json(path: Path) -> dict[str, Any]:
 
 
 def fsync_dir(path: Path) -> None:
-    try:
-        fd = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
         os.fsync(fd)
-    except OSError:
-        pass
+    except OSError as exc:
+        if exc.errno not in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS:
+            raise
     finally:
         os.close(fd)
 
@@ -244,17 +347,111 @@ def app_lock(paths: AppPaths, *, backend: LockBackend | None = None) -> Iterator
         os.close(fd)
 
 
-def _directory_without_symlinks(path: Path, *, label: str) -> Path:
+def _inspect_directory_anchor(
+    path: Path, *, label: str, allow_missing: bool = False
+) -> os.stat_result | None:
+    if not path.is_absolute():
+        raise ValueError(f"{label} must be absolute: {path}")
+    try:
+        canonical = path.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"{label} cannot be canonicalized: {path}: {exc}") from exc
+    if canonical != path:
+        raise ValueError(f"{label} is not canonical or has a symlinked ancestor: {path}")
     try:
         info = path.lstat()
+    except FileNotFoundError:
+        if allow_missing:
+            return None
+        raise ValueError(f"{label} is unavailable: {path}") from None
     except OSError as exc:
         raise ValueError(f"{label} is unavailable: {path}: {exc}") from exc
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         raise ValueError(f"{label} is not a real directory: {path}")
+    return info
+
+
+def _directory_anchor_children(path: Path, *, label: str) -> list[Path]:
+    info = _inspect_directory_anchor(path, label=label, allow_missing=True)
+    if info is None:
+        return []
     try:
-        return path.resolve(strict=True)
+        with os.scandir(path) as entries:
+            children = sorted(entries, key=lambda entry: entry.name)
+    except OSError as exc:
+        raise ValueError(f"{label} cannot be scanned: {path}: {exc}") from exc
+    result = []
+    for entry in children:
+        child = Path(entry.path)
+        _inspect_directory_anchor(child, label=f"{label} child")
+        result.append(child)
+    return result
+
+
+def _secure_directory_anchor(path: Path, *, label: str, parents: bool) -> Path:
+    info = _inspect_directory_anchor(path, label=label, allow_missing=True)
+    if info is None:
+        try:
+            path.mkdir(parents=parents, mode=0o700)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise ValueError(f"{label} cannot be created: {path}: {exc}") from exc
+        info = _inspect_directory_anchor(path, label=label)
+    if os.name != "nt" and stat.S_IMODE(info.st_mode) != 0o700:
+        try:
+            path.chmod(0o700)
+        except OSError as exc:
+            raise ValueError(f"{label} permissions cannot be secured: {path}: {exc}") from exc
+        info = _inspect_directory_anchor(path, label=label)
+        if stat.S_IMODE(info.st_mode) != 0o700:
+            raise ValueError(f"{label} permissions are not private: {path}")
+    return path
+
+
+def validate_private_subdirectory(root: Path, *parts: str) -> Path:
+    """Validate a private descendant path without creating it."""
+
+    _directory_without_symlinks(root, label="private root")
+    current = root
+    for part in parts:
+        component = Path(part)
+        if component.is_absolute() or component.parts != (part,) or part in {"", ".", ".."}:
+            raise ValueError(f"private directory has an invalid component: {part}")
+        target = current / part
+        _inspect_directory_anchor(
+            target, label="private subdirectory", allow_missing=True
+        )
+        if target.parent != current:
+            raise ValueError(f"private subdirectory escaped its root: {target}")
+        current = target
+    return current
+
+
+def ensure_private_subdirectory(root: Path, *parts: str) -> Path:
+    """Create validated private directories below one canonical private root."""
+
+    validate_private_subdirectory(root, *parts)
+    current = root
+    for part in parts:
+        current = _secure_directory_anchor(
+            current / part, label="private subdirectory", parents=False
+        )
+    return current
+
+
+def _directory_without_symlinks(path: Path, *, label: str) -> Path:
+    info = _inspect_directory_anchor(path, label=label)
+    assert info is not None
+    if os.name != "nt" and stat.S_IMODE(info.st_mode) != 0o700:
+        raise ValueError(f"{label} permissions are not private: {path}")
+    try:
+        canonical = path.resolve(strict=True)
     except OSError as exc:
         raise ValueError(f"{label} cannot be canonicalized: {path}: {exc}") from exc
+    if canonical != path:
+        raise ValueError(f"{label} is not canonical: {path}")
+    return canonical
 
 
 def safe_cas_root(archive: Path) -> tuple[Path, Path]:
@@ -286,20 +483,41 @@ def safe_cas_shard(archive: Path, shard_name: str) -> tuple[Path, Path]:
 
 
 def ensure_safe_cas_shard(archive: Path, shard_name: str) -> Path:
-    _directory_without_symlinks(archive, label="archive root")
-    objects = archive / "objects"
-    objects.mkdir(exist_ok=True, mode=0o700)
-    _directory_without_symlinks(objects, label="archive objects root")
-    root = archive / "objects" / "sha256"
-    root.mkdir(exist_ok=True, mode=0o700)
-    _directory_without_symlinks(root, label="archive CAS root")
-    shard = root / shard_name
-    shard.mkdir(exist_ok=True, mode=0o700)
+    if len(shard_name) != 2 or any(
+        character not in "0123456789abcdef" for character in shard_name
+    ):
+        raise ValueError(f"invalid archive CAS shard: {shard_name}")
+    shard = ensure_private_subdirectory(
+        archive, "objects", "sha256", shard_name
+    )
     safe_cas_shard(archive, shard_name)
     return shard
 
 
-def safe_cas_object_path(archive: Path, value: str) -> Path:
+def cas_object_name_details(
+    name: str,
+) -> tuple[CasObjectKind, str, str | None] | None:
+    """Classify a CAS name and return its shard and compressed digest."""
+
+    zstd = _CAS_ZSTD_NAME.fullmatch(name)
+    if zstd is not None:
+        return "zstd", zstd.group("raw")[:2], zstd.group("compressed")
+    dictionary = _CAS_DICTIONARY_NAME.fullmatch(name)
+    if dictionary is not None:
+        return "dictionary", dictionary.group("raw")[:2], None
+    temporary = _CAS_TEMP_NAME.fullmatch(name)
+    if temporary is not None:
+        return "temporary", temporary.group("raw")[:2], None
+    return None
+
+
+def safe_cas_object_path(
+    archive: Path,
+    value: str,
+    *,
+    kind: CasObjectKind,
+    content_validation: bool = True,
+) -> Path:
     relative = Path(value)
     if (
         relative.is_absolute()
@@ -308,7 +526,15 @@ def safe_cas_object_path(archive: Path, value: str) -> Path:
         or relative.parts[:2] != ("objects", "sha256")
     ):
         raise ValueError(f"archive object escaped the CAS: {value}")
-    shard, canonical_shard = safe_cas_shard(archive, relative.parts[2])
+    details = cas_object_name_details(relative.name)
+    if details is None or details[0] != kind:
+        raise ValueError(
+            f"archive object has an invalid CAS name for {kind}: {value}"
+        )
+    _, expected_shard, compressed_digest = details
+    if relative.parts[2] != expected_shard:
+        raise ValueError(f"archive object is in the wrong CAS shard: {value}")
+    shard, canonical_shard = safe_cas_shard(archive, expected_shard)
     target = shard / relative.parts[3]
     try:
         info = target.lstat()
@@ -327,40 +553,50 @@ def safe_cas_object_path(archive: Path, value: str) -> Path:
         raise ValueError(f"archive object escaped the canonical CAS: {target}") from exc
     if canonical_target.parent != canonical_shard:
         raise ValueError(f"archive object escaped its canonical shard: {target}")
+    if (
+        content_validation
+        and compressed_digest is not None
+        and sha256_file(target) != compressed_digest
+    ):
+        raise ValueError(f"archive CAS compressed digest mismatch: {target}")
     return target
 
 
-def prune_expired_plans(paths: AppPaths, *, keep: int = 32) -> int:
-    """Bound tool-owned plan history while preserving every live plan."""
-
+def _prune_expired_plans_locked(paths: AppPaths, *, keep: int) -> int:
     if keep < 0:
         raise ValueError("retained expired plan count must be non-negative")
     plans_root = paths.state / "plans"
     if not plans_root.is_dir() or plans_root.is_symlink():
         return 0
+    expired: list[tuple[datetime, Path, dict[str, int]]] = []
+    current = utc_now()
+    for plan_path in sorted(plans_root.glob("*.json")):
+        try:
+            identity = regular_file_stat(plan_path)
+            payload = load_json(plan_path)
+            expires_at = payload.get("expires_at")
+            if isinstance(expires_at, str) and parse_timestamp(expires_at) < current:
+                expired.append((parse_timestamp(expires_at), plan_path, identity))
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+            continue
+    expired.sort(key=lambda item: (item[0], str(item[1])), reverse=True)
+    removed = 0
+    for _, plan_path, identity in expired[keep:]:
+        if not identity_matches(plan_path, identity):
+            continue
+        try:
+            plan_path.unlink()
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def prune_expired_plans(paths: AppPaths, *, keep: int = 32) -> int:
+    """Bound tool-owned plan history while preserving every live plan."""
+
     with app_lock(paths):
-        expired: list[tuple[datetime, Path, dict[str, int]]] = []
-        current = utc_now()
-        for plan_path in sorted(plans_root.glob("*.json")):
-            try:
-                identity = regular_file_stat(plan_path)
-                payload = load_json(plan_path)
-                expires_at = payload.get("expires_at")
-                if isinstance(expires_at, str) and parse_timestamp(expires_at) < current:
-                    expired.append((parse_timestamp(expires_at), plan_path, identity))
-            except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
-                continue
-        expired.sort(key=lambda item: (item[0], str(item[1])), reverse=True)
-        removed = 0
-        for _, plan_path, identity in expired[keep:]:
-            if not identity_matches(plan_path, identity):
-                continue
-            try:
-                plan_path.unlink()
-                removed += 1
-            except OSError:
-                continue
-        return removed
+        return _prune_expired_plans_locked(paths, keep=keep)
 
 
 def open_file_paths(*, strict: bool = False) -> set[Path]:
@@ -378,9 +614,10 @@ def open_file_paths(*, strict: bool = False) -> set[Path]:
             raise RuntimeError("open-file enumeration unavailable: lsof was not found")
         return set()
     result = subprocess.run(
-        [discovered, "-nP", "-Fn"],
+        [discovered, "-nP", "-Fn0"],
         capture_output=True,
         text=True,
+        errors="surrogateescape",
         check=False,
     )
     if strict and result.returncode != 0:
@@ -389,11 +626,7 @@ def open_file_paths(*, strict: bool = False) -> set[Path]:
         raise RuntimeError(f"open-file enumeration failed with status {result.returncode}{suffix}")
     if result.returncode not in (0, 1):
         return set()
-    paths: set[Path] = set()
-    for line in result.stdout.splitlines():
-        if line.startswith("n/"):
-            paths.add(Path(line[1:]))
-    return paths
+    return _parse_lsof_paths(result.stdout)
 
 
 def _lsof_binary() -> str | None:
@@ -403,16 +636,109 @@ def _lsof_binary() -> str | None:
     return discovered
 
 
+class _LsofPaths(set[Path]):
+    def __init__(self, paths: Iterable[Path], encoded_names: Iterable[str]) -> None:
+        super().__init__(paths)
+        self.encoded_names = list(encoded_names)
+
+    def update(self, *others: Iterable[Path]) -> None:
+        for other in others:
+            if isinstance(other, _LsofPaths):
+                self.encoded_names.extend(other.encoded_names)
+            super().update(other)
+
+
 def _parse_lsof_paths(output: str) -> set[Path]:
-    return {Path(line[1:]) for line in output.splitlines() if line.startswith("n/")}
+    fields = [field.lstrip("\n") for field in output.split("\0")]
+    names = [field[1:] for field in fields if field.startswith("n/")]
+    return _LsofPaths(
+        (Path(value) for name in names for value in _decode_lsof_names(name)),
+        names,
+    )
+
+
+def _decode_lsof_names(value: str) -> set[str]:
+    decoded, _ = _decode_lsof_value(value)
+    return {os.fsdecode(item) for item in decoded}
+
+
+def _decode_lsof_value(value: str) -> tuple[set[bytes], bool]:
+    raw = os.fsencode(value)
+    escapes = {
+        ord("b"): 8,
+        ord("f"): 12,
+        ord("n"): 10,
+        ord("r"): 13,
+        ord("t"): 9,
+        ord("\\"): 92,
+    }
+    pending = [(0, b"")]
+    decoded = set()
+    while pending and len(decoded) < 4096:
+        index, prefix = pending.pop()
+        if index == len(raw):
+            decoded.add(prefix)
+            continue
+        current = raw[index]
+        if current == 92 and index + 1 < len(raw):
+            escaped = raw[index + 1]
+            if escaped in escapes:
+                pending.append((index + 2, prefix + bytes((escapes[escaped],))))
+                continue
+            if escaped == ord("x") and index + 3 < len(raw):
+                try:
+                    pending.append(
+                        (index + 4, prefix + bytes((int(raw[index + 2 : index + 4], 16),)))
+                    )
+                    continue
+                except ValueError:
+                    pass
+        if current == ord("^") and index + 1 < len(raw):
+            control = raw[index + 1]
+            if control == ord("?") or 65 <= control <= 95:
+                pending.append(
+                    (index + 2, prefix + bytes((255 if control == ord("?") else control & 31,)))
+                )
+                pending.append((index + 1, prefix + b"^"))
+                continue
+        pending.append((index + 1, prefix + bytes((current,))))
+    return decoded, not pending
+
+
+def _lsof_component_matches(encoded: str, component: str) -> bool:
+    decoded, complete = _decode_lsof_value(encoded)
+    if not complete:
+        return True
+    expected = unicodedata.normalize("NFC", component).casefold()
+    return any(
+        unicodedata.normalize("NFC", os.fsdecode(value)).casefold() == expected
+        for value in decoded
+    )
+
+
+def _lsof_name_matches_root(encoded_name: str, root: Path) -> bool:
+    encoded_parts = encoded_name.split("/")
+    root_parts = root.parts
+    if not root.is_absolute() or not encoded_parts or encoded_parts[0]:
+        return False
+    components = root_parts[1:]
+    return len(encoded_parts) - 1 >= len(components) and all(
+        _lsof_component_matches(encoded, component)
+        for encoded, component in zip(encoded_parts[1:], components, strict=False)
+    )
 
 
 def open_file_paths_for(
     candidates: Iterable[Path],
     *,
     batch_size: int = 128,
+    recursive: bool = False,
 ) -> set[Path]:
-    """Enumerate open candidate paths through bounded, path-filtered lsof calls."""
+    """Enumerate open candidate paths through bounded, path-filtered lsof calls.
+
+    Recursive mode uses one ``+D`` query per directory because naming a
+    directory alone does not select its open descendants.
+    """
 
     if batch_size <= 0:
         raise ValueError("lsof batch size must be positive")
@@ -422,33 +748,65 @@ def open_file_paths_for(
     binary = _lsof_binary()
     if binary is None:
         raise RuntimeError("open-file enumeration unavailable: lsof was not found")
-    opened: set[Path] = set()
-    for offset in range(0, len(paths), batch_size):
-        batch = paths[offset : offset + batch_size]
-        result = subprocess.run(
-            [binary, "-nP", "-Fn", *(str(path) for path in batch)],
-            capture_output=True,
-            text=True,
-            check=False,
+    opened: set[Path] = _LsofPaths((), ())
+    batches = (
+        tuple((path,) for path in paths)
+        if recursive
+        else tuple(
+            paths[offset : offset + batch_size]
+            for offset in range(0, len(paths), batch_size)
         )
-        if result.returncode == 1 and not result.stdout.strip() and not result.stderr.strip():
-            continue
-        if result.returncode != 0:
-            detail = result.stderr.strip()
-            suffix = f": {detail}" if detail else ""
+    )
+    for batch in batches:
+        filters = [str(path) for path in batch]
+        if recursive and batch[0].is_dir():
+            filters = ["-x", "f", "+D", str(batch[0])]
+        try:
+            result = subprocess.run(
+                [binary, "-nP", "-Fn0", *filters],
+                capture_output=True,
+                text=True,
+                errors="surrogateescape",
+                check=False,
+            )
+        except OSError as exc:
             raise RuntimeError(
-                f"path-filtered open-file enumeration failed with status {result.returncode}{suffix}"
+                f"path-filtered open-file enumeration could not execute: {exc}"
+            ) from exc
+        if result.stderr:
+            detail = result.stderr.strip() or repr(result.stderr)
+            raise RuntimeError(
+                "path-filtered open-file enumeration reported diagnostics "
+                f"with status {result.returncode}: {detail}"
+            )
+        if result.returncode not in (0, 1):
+            raise RuntimeError(
+                f"path-filtered open-file enumeration failed with status {result.returncode}"
             )
         opened.update(_parse_lsof_paths(result.stdout))
     return opened
 
 
 def any_open(paths: Iterable[Path], opened: set[Path]) -> bool:
-    resolved = [str(path) for path in paths]
+    def components(path: Path) -> tuple[str, ...]:
+        return tuple(
+            unicodedata.normalize("NFC", part).casefold()
+            for part in path.resolve(strict=False).parts
+        )
+
+    resolved = [path.resolve(strict=False) for path in paths]
+    if isinstance(opened, _LsofPaths) and any(
+        _lsof_name_matches_root(name, root)
+        for name in opened.encoded_names
+        for root in resolved
+    ):
+        return True
+    roots = [components(path) for path in resolved]
     for candidate in opened:
-        value = str(candidate)
-        if any(value == root or value.startswith(root + os.sep) for root in resolved):
-            return True
+        value = components(candidate)
+        for root in roots:
+            if value[: len(root)] == root:
+                return True
     return False
 
 
