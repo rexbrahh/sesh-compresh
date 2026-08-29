@@ -103,7 +103,7 @@ recovery drill:
 Keep the recovery file offline and separate from the archive. Losing both the
 keyring entry and this file makes encrypted CAS payloads unrecoverable.
 
-Each archive operation publishes a new immutable point-in-time manifest. A stable session key and monotonic version ordinal identify related versions. The latest pointer lives in private state under `latest`. It resolves the highest retained ordinal. Recovery repairs the pointer after a partial publication, and expiry repoints or removes it after deleting versions. Immutable manifests remain authoritative if the derived pointer is missing or invalid.
+Each archive operation publishes a new immutable point-in-time manifest. A stable session key and monotonic version ordinal identify related versions. The latest pointer lives in private state under `latest`. It resolves the highest retained ordinal. Recovery repairs the pointer after a partial publication, and expiry repoints or removes it after deleting versions. Immutable manifests remain authoritative if the derived pointer is missing or invalid. The narrow exception is `archive repack`: after proving byte-exact identity, it may atomically replace only a whole-file member's `object` and `compressed_sha256` storage fields. Archive identity, manifest path, timestamps, schema, and every logical metadata field remain unchanged.
 
 `archive list` filters by provider, session identifier, `archived_at` UTC date, and version ordinal. It sorts by activity, archive time, raw bytes, compression ratio, or version. Results use descending order by default. Every order has deterministic identity tie-breakers, and `--reverse` selects ascending order.
 
@@ -163,9 +163,9 @@ Archive reports logical source bytes separately from unique compressed member by
 ## Maintenance history
 
 Successful primitive mutations append one immutable event under the private
-state directory. Archive apply, direct archive, observer garbage collection,
-dictionary promotion, archive expiry, cleanup apply, cleanup undo, and cleanup
-expiry produce events. The `maintain` command does not produce another event.
+state directory. Archive apply, direct archive, archive repack, observer
+garbage collection, dictionary promotion, archive expiry, cleanup apply,
+cleanup undo, and cleanup expiry produce events. The `maintain` command does not produce another event.
 It uses the events from the primitive operations that it calls.
 
 Each event keeps logical archive bytes, logical reclamation, allocated-byte
@@ -205,7 +205,7 @@ provider pointer or retained immutable manifest references it. A missing or
 unverifiable dictionary only falls back to plain compression. It never blocks
 archiving.
 
-Manifests live under `~/.local/share/sesh-compresh/archives/manifests`; objects live under the adjacent `objects/sha256` tree. Runtime plans and quarantine journals live under `~/.local/state/sesh-compresh`.
+Manifests live under `~/.local/share/sesh-compresh/archives/manifests`; objects live under the adjacent `objects/sha256` tree. Runtime plans, quarantine journals, and the independent repack journal live under `~/.local/state/sesh-compresh`.
 
 Configured roots must be absolute. Discovery stores canonical paths. Before a command writes, it validates every tool-owned anchor as a real directory with no symlinked ancestor. This check covers archive, state, manifest, provider, CAS, plan, and quarantine anchors. It checks every existing dynamic provider, shard, and quarantine-run anchor in one read-only pass. After structural validation, it creates missing anchors and sets each tool-owned anchor to `0700` on POSIX systems.
 

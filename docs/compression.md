@@ -62,6 +62,16 @@ single-record chunk at or above 8 MiB uses `-19 --long=27`. Window log 27
 stays within the zstd CLI's default decode memory limit, so restore and
 verify need no extra flags for long-mode frames.
 
+Legacy whole-file objects can be upgraded in place with `archive repack`.
+Planning validates the complete archive graph and selects raw-hash-only frames
+at or above 8 MiB by default. Apply streams decode into
+`zstd -19 --long=27 --check -T0`, adopts only smaller frames, and fully decodes
+and rehashes each candidate before changing its manifest storage reference.
+The digest-bound plan expires after two hours. `archive repack recover` handles
+its journal independently of archive-publication recovery. Encrypted archives,
+schema conversion, chunking conversion, dictionaries, and reference recipes
+are outside this repack path.
+
 ### 1.2 Shared trained dictionary
 
 **Status: implemented.** `archive benchmark --provider P` snapshots complete

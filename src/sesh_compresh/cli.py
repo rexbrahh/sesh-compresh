@@ -63,6 +63,7 @@ from .portable import (
     export_portable_archive,
     recover_portable_imports,
 )
+from .repack import apply_repack_plan, create_repack_plan, recover_repack
 from .scheduling import (
     DEFAULT_INTERVAL_SECONDS,
     DEFAULT_LOW_SPACE_BYTES,
@@ -561,6 +562,18 @@ def build_parser() -> argparse.ArgumentParser:
     archive_extract.add_argument("--length", type=int)
     archive_extract.add_argument("--tail-bytes", type=int)
     archive_sub.add_parser("recover")
+    archive_repack = archive_sub.add_parser("repack")
+    archive_repack_sub = archive_repack.add_subparsers(
+        dest="archive_repack_command", required=True
+    )
+    archive_repack_plan = archive_repack_sub.add_parser("plan")
+    archive_repack_plan.add_argument(
+        "--minimum-compressed-mib", type=int, default=8
+    )
+    archive_repack_apply = archive_repack_sub.add_parser("apply")
+    archive_repack_apply.add_argument("plan", type=Path)
+    archive_repack_apply.add_argument("--yes", action="store_true", required=True)
+    archive_repack_sub.add_parser("recover")
     archive_encryption = archive_sub.add_parser("encryption")
     archive_encryption_sub = archive_encryption.add_subparsers(
         dest="archive_encryption_command", required=True
@@ -1019,6 +1032,19 @@ def main(argv: list[str] | None = None) -> int:
                 _emit(result, args.json)
             elif args.archive_command == "recover":
                 _emit(recover_quarantine(paths), args.json)
+            elif args.archive_command == "repack":
+                if args.archive_repack_command == "plan":
+                    plan_path, plan = create_repack_plan(
+                        paths,
+                        minimum_compressed_bytes=(
+                            args.minimum_compressed_mib * 1024**2
+                        ),
+                    )
+                    _emit({"plan": str(plan_path), **plan}, args.json)
+                elif args.archive_repack_command == "apply":
+                    _emit(apply_repack_plan(paths, args.plan), args.json)
+                else:
+                    _emit(recover_repack(paths), args.json)
             elif args.archive_command == "encryption":
                 if args.archive_encryption_command == "enable":
                     result = enable_archive_encryption(paths, args.recovery_file)

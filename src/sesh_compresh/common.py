@@ -61,6 +61,7 @@ _STATE_PRIVATE_LAYOUT = (
     ("latest",),
     ("plans",),
     ("quarantine",),
+    ("repack",),
 )
 
 

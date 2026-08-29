@@ -22,11 +22,30 @@ From source (Python 3.13+, stdlib only): `pipx install .`
 PYTHONPATH=src python3 -m sesh_compresh audit
 PYTHONPATH=src python3 -m sesh_compresh archive plan
 PYTHONPATH=src python3 -m sesh_compresh archive stats
+PYTHONPATH=src python3 -m sesh_compresh archive repack plan
 PYTHONPATH=src python3 -m sesh_compresh archive train-dictionary --provider claude
 PYTHONPATH=src python3 -m sesh_compresh archive encryption status
 PYTHONPATH=src python3 -m sesh_compresh observer plan
 PYTHONPATH=src python3 -m sesh_compresh clean plan --profile practical
 ```
+
+## Legacy archive repack
+
+```sh
+# Create a digest-bound two-hour plan for legacy frames at least 8 MiB.
+PYTHONPATH=src python3 -m sesh_compresh archive repack plan
+
+# Review the plan, then losslessly replace beneficial storage frames.
+PYTHONPATH=src python3 -m sesh_compresh archive repack apply /path/to/archive-repack-PLAN.json --yes
+
+# Finish or roll back an interrupted repack transaction.
+PYTHONPATH=src python3 -m sesh_compresh archive repack recover
+```
+
+Repack preserves archive IDs, manifest paths, timestamps, schemas, and logical
+metadata. It changes only a member's `object` and `compressed_sha256` when
+`zstd -19 --long=27` produces a smaller, fully verified frame. Encrypted
+archives are not supported by repack.
 
 ## Portable archives
 

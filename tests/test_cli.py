@@ -14,6 +14,82 @@ from sesh_compresh.common import AppPaths, atomic_json
 
 
 class CliTests(unittest.TestCase):
+    def test_archive_repack_commands_dispatch_and_require_confirmation(self) -> None:
+        parser = cli_module.build_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["archive", "repack", "apply", "/plan.json"])
+
+        with tempfile.TemporaryDirectory() as home:
+            plan_path = Path(home) / "repack-plan.json"
+            plan_report = {
+                "plan": str(plan_path),
+                "candidates": 2,
+                "manifests": 2,
+                "raw_bytes": 30,
+                "compressed_bytes": 20,
+            }
+            with (
+                mock.patch.object(
+                    cli_module,
+                    "create_repack_plan",
+                    create=True,
+                    return_value=(plan_path, plan_report),
+                ) as create,
+                mock.patch.object(
+                    cli_module,
+                    "apply_repack_plan",
+                    create=True,
+                    return_value={"repacked": 2},
+                ) as apply,
+                mock.patch.object(
+                    cli_module,
+                    "recover_repack",
+                    create=True,
+                    return_value={"completed": 1, "rolled_back": 0},
+                ) as recover,
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(
+                    0,
+                    cli_module.main(
+                        [
+                            "--home",
+                            home,
+                            "archive",
+                            "repack",
+                            "plan",
+                            "--minimum-compressed-mib",
+                            "3",
+                        ]
+                    ),
+                )
+                self.assertEqual(
+                    0,
+                    cli_module.main(
+                        [
+                            "--home",
+                            home,
+                            "archive",
+                            "repack",
+                            "apply",
+                            str(plan_path),
+                            "--yes",
+                        ]
+                    ),
+                )
+                self.assertEqual(
+                    0,
+                    cli_module.main(
+                        ["--home", home, "archive", "repack", "recover"]
+                    ),
+                )
+
+        create.assert_called_once_with(
+            mock.ANY, minimum_compressed_bytes=3 * 1024**2
+        )
+        apply.assert_called_once_with(mock.ANY, plan_path)
+        recover.assert_called_once_with(mock.ANY)
+
     def test_history_command_emits_read_only_summary(self) -> None:
         report = {
             "events": 2,
