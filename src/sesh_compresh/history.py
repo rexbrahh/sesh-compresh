@@ -35,6 +35,7 @@ HISTORY_OPERATIONS = frozenset(
         "dictionary-train",
         "observer-expiry",
         "observer-gc",
+        "archive-repack",
     }
 )
 _EVENT_KEYS = {
